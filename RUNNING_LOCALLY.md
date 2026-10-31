@@ -64,29 +64,32 @@ backend above.
 
 ## 4. Try it
 
-- Sample load: click the sample option in the dashboard. It streams
-  `edr_events.json` through the same ingestion path as an upload.
-  If that file is missing in your clone, regenerate an equivalent
-  10,000-event sample with the generator already in the repo:
+- Sample load: click the sample option in the dashboard. If
+  `edr_events.json` is missing in your clone, the backend auto-generates
+  an equivalent 10,000-event sample with `edr_log_generator.py`
+  (generated events are random, so counts will differ from the original
+  sample, but the shape is the same).
+- Your own log, best for a 6 GB file: do NOT upload it through the
+  browser. Put `firex-10G.log` in the repo root, then, with the venv
+  activated, from the repo root:
   ```bash
-  python edr_log_generator.py --count 10000 --output file --file edr_events.json
+  python -m backend.ingest_file firex-10G.log --detect-only
+  python -m backend.ingest_file firex-10G.log
   ```
-  (Generated events are random, so counts will differ from the original
-  sample, but the shape is the same.)
-- Your own log: use the dashboard upload (multipart field `file`,
-  `POST /api/ingest`), then poll `GET /api/ingest/progress`.
-  A 6 GB log takes roughly 30–35 minutes at the measured ~3,750 rows/s
-  and produces roughly a 4 GB DuckDB file (`mitigata_logs.duckdb`),
-  so keep disk free.
+  Or, with the backend running: `POST /api/ingest/local?path=firex-10G.log`.
+  The parallel path measured ~17,500 rows/s on a 200k-row test, so a
+  6.1 GB JSONL log (~8-9M rows) is roughly 8-9 minutes, and the DuckDB
+  file (`mitigata_logs.duckdb`) is roughly 2-4 GB -- keep 10 GB free.
+  A browser upload also works (`POST /api/ingest`), then the frontend
+  fetches `GET /api/dashboard` separately.
 - Reports: `POST /api/reports/generate`, then download the PDF from
   `GET /api/reports/download/{report_id}`.
 
 ## Notes
 
-- `public/logo.png` (navbar logo / favicon) and the unreferenced images
-  under `public/assets/aistudio/` are not in this repo snapshot: the
-  snapshot push route only handles text files. The app still runs
-  without them; the logo will just be a broken image until you add a
-  `public/logo.png` of your own.
+- The logo is now `public/logo.svg` (a text file, so it pushes fine).
+  The original `public/logo.png` and the unreferenced images under
+  `public/assets/aistudio/` are not in this repo snapshot: the snapshot
+  push route only handles text files, and is not needed to run.
 - `mitigata_logs.duckdb`, `.venv/`, `__pycache__/`, `uploads/` and
   `backend/.env` are git-ignored and are created locally when you run it.
