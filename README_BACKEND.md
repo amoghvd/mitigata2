@@ -232,3 +232,17 @@ Why it is fast on an 8 GB PC:
   GitHub snapshot route used here, so it must be added on your PC (or
   via the GitHub web UI) after pulling -- it will not appear in a
   snapshot push from Muse.
+
+## Favicon and the black page on Launch Incident Workspace
+- Favicon is `public/logo.png` (first icon link in `index.html`),
+  with `public/logo.svg` as a second link. The navbar also tries
+  `/logo.png` first and falls back to `/logo.svg`.
+- Black page fix (2026-11-01): clicking Launch Incident Workspace
+  switched to the dashboard, which rendered graph nodes. The selected-
+  path code assigned `nodeBorder`/`accentColor` BEFORE their `let`
+  declarations, which throws "Cannot access nodeBorder before
+  initialization" in JavaScript and unmounts the whole React app,
+  leaving only the dark page background. The highlight is now applied
+  after the declarations. If you ever see a blank dark page again,
+  open the browser console (F12) first -- a render error there is the
+  cause, not a redirect (Launch is an in-page switch, not a new page).
