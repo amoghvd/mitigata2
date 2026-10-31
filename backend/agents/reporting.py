@@ -35,6 +35,14 @@ def _post_json(url: str, payload: Dict[str, Any], headers: Dict[str, str], timeo
 
 def generate_multilingual_narrative(incident_context: Dict[str, Any],
                                     language: str = "en") -> Dict[str, Any]:
+    # Belt and braces: the .env file is loaded at app startup, but a
+    # direct call to this function (reports endpoint, tests) should also
+    # see a key that was only put in backend/.env, not exported.
+    try:
+        from backend.dotenv import load_env_files
+        load_env_files()
+    except Exception:
+        pass
     title = incident_context.get("title", "High-Priority Threat Incident")
     severity = incident_context.get("severity", "CRITICAL")
     score = incident_context.get("score", 0)
@@ -61,7 +69,7 @@ def generate_multilingual_narrative(incident_context: Dict[str, Any],
                     {"role": "system", "content": "You are Mitigata Security Intelligence AI."},
                     {"role": "user", "content": prompt}],
                 "temperature": 0.2, "max_tokens": 512},
-                {"Content-Type": "application/json", "api-subscription-key": key}, timeout=8.0)
+                {"Content-Type": "application/json", "api-subscription-key": key}, timeout=20.0)
             text = res["choices"][0]["message"]["content"].strip()
             if text:
                 return {"narrative": text, "provider": "Sarvam AI", "language": language,

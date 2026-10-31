@@ -24,9 +24,13 @@ export const Navbar: React.FC<NavbarProps> = ({
           className="flex items-center gap-2.5 text-left group focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 rounded-md shrink-0 cursor-pointer"
         >
           <img
-            src="/logo.svg"
+            src="/logo.png"
             alt="ASK Logo"
             className="w-8 h-8 object-contain"
+            onError={(e) => {
+              const img = e.currentTarget;
+              if (!img.src.endsWith('/logo.svg')) img.src = '/logo.svg';
+            }}
           />
           <span className="text-base font-bold tracking-tight text-zinc-900 dark:text-zinc-100 font-sans whitespace-nowrap">
             ASK

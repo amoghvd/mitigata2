@@ -22,6 +22,10 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from backend.dotenv import load_env_files
+
+load_env_files()
+
 from backend.database import (
     aggregate_counts, alerts_count, clear_logs, get_health_stats,
     get_sample_logs, init_schema, get_db_connection, ip_host_map, top_edges, total_rows,
@@ -44,6 +48,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    load_env_files()
     init_schema(get_db_connection())
     yield
 
@@ -378,6 +383,7 @@ async def attack_story(language: str = Query("en")):
     agg = aggregate_counts()
     if not best:
         return {"provider": "none", "ai_provider": "none",
+                "key_configured": bool(os.environ.get("SARVAM_API_KEY", "").strip()),
                 "narrative": "No attack path found: no threat edges in the loaded data.",
                 "narrative_short": "No attack path found: no threat edges in the loaded data.",
                 "best_path": None, "paths": []}
@@ -392,6 +398,9 @@ async def attack_story(language: str = Query("en")):
     lang = language if language in ("en", "hi", "te", "ml") else "en"
     res = generate_multilingual_narrative(ctx, language=lang)
     return {"provider": res["provider"], "ai_provider": res["provider"],
+            # Boolean only, never the key value: lets the UI explain
+            # "key set but Sarvam did not answer" vs "no key set".
+            "key_configured": bool(os.environ.get("SARVAM_API_KEY", "").strip()),
             "is_sarvam": res["provider"] == "Sarvam AI",
             "narrative": res["narrative"],
             "narrative_short": _shorten(res["narrative"]),

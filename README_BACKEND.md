@@ -207,3 +207,28 @@ Why it is fast on an 8 GB PC:
   case, instead of pretending it is Sarvam.
 - `POST /api/sample/demo` loads `sample_demo.jsonl` (5 rows, one clear
   chain) for demos. The dashboard also has a "Tiny Demo (5 rows)" button.
+
+
+## Logo: where to put logo.png, and removing its white background
+- Proper location: `public/logo.png` in the repo root (next to
+  `public/logo.svg`). The navbar tries `/logo.png` first and falls back
+  to `/logo.svg` if it is missing, so the site never shows a broken
+  image. For the favicon, after you add `logo.png`, change one line in
+  `index.html` from
+  `<link rel="icon" type="image/svg+xml" href="/logo.svg" />`
+  to
+  `<link rel="icon" type="image/png" href="/logo.png" />`
+  (browsers do not fall back on favicons, so this swap is manual).
+- White background: after putting `logo.png` in `public/`, run, from
+  the repo root:
+  ```
+  pip install pillow
+  python scripts/remove_white_bg.py
+  ```
+  That makes near-white pixels transparent, in place, without changing
+  any other colour. Do NOT commit a logo.png with a white background
+  if you want it to sit cleanly on the dark navbar.
+- Note: `logo.png` is a binary file and cannot be pushed through the
+  GitHub snapshot route used here, so it must be added on your PC (or
+  via the GitHub web UI) after pulling -- it will not appear in a
+  snapshot push from Muse.

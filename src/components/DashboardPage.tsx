@@ -110,7 +110,8 @@ export const DashboardPage: React.FC = () => {
   const [canvasViewMode, setCanvasViewMode] = useState<'kill-chain' | 'quantum-walk'>('kill-chain');
   const [attackPaths, setAttackPaths] = useState<any[]>([]);
   const [bestPath, setBestPath] = useState<any | null>(null);
-  const [story, setStory] = useState<{ narrative_short: string; provider: string; is_sarvam: boolean } | null>(null);
+  const [story, setStory] = useState<{ narrative_short: string; provider: string; is_sarvam: boolean; key_configured?: boolean } | null>(null);
+  const [selectedPath, setSelectedPath] = useState<any | null>(null);
 
   // Smooth Pan & Drag State for Canvas
   const [panOffset, setPanOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
@@ -121,7 +122,7 @@ export const DashboardPage: React.FC = () => {
   const fetchPathsAndStory = async () => {
     try {
       const pr = await fetch('/api/paths');
-      if (pr.ok) { const pd = await pr.json(); setAttackPaths(pd.paths || []); setBestPath(pd.best_path || null); }
+      if (pr.ok) { const pd = await pr.json(); setAttackPaths(pd.paths || []); setBestPath(pd.best_path || null); setSelectedPath(pd.best_path || null); }
     } catch {}
     try {
       const sr = await fetch('/api/story');
@@ -271,6 +272,7 @@ export const DashboardPage: React.FC = () => {
     setSelectedNodeId(null);
     setNodes([]);
     setEdges([]);
+    setAttackPaths([]); setBestPath(null); setSelectedPath(null); setStory(null);
     try {
       await fetch('/api/logs', { method: 'DELETE' });
     } catch {
@@ -883,6 +885,21 @@ export const DashboardPage: React.FC = () => {
               Drag background to pan left/right
             </span>
           </div>
+          <div className="px-4 py-2 border-b border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 text-[11px] text-zinc-600 dark:text-zinc-400">
+            {canvasViewMode === 'kill-chain' ? (
+              <span><b className="text-zinc-900 dark:text-zinc-100">Kill Chain graph, in plain words:</b> each box is a computer (IP). An arrow means traffic went from one computer to another. Amber arrows are attack steps, in order: first access, then running code, then stealing passwords, then moving sideways, then reaching the target. Follow the amber arrows to read the attack story.</span>
+            ) : (
+              <span><b className="text-zinc-900 dark:text-zinc-100">Quantum graph, in plain words:</b> the same computers, but now each arrow shows a percentage — how likely the attacker is to jump to that computer next, calculated with a quantum (Qiskit) calculation. Green, thick arrows are the most likely next jumps. It answers one question: "where will the attacker go next?"</span>
+            )}
+          </div>
+          {selectedPath && (
+            <div className="px-4 py-1.5 border-b border-emerald-200 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-950/40 text-[11px] font-mono flex items-center justify-between gap-2">
+              <span className="text-emerald-700 dark:text-emerald-300 truncate">
+                Showing path #{selectedPath.rank} — {(selectedPath.confidence * 100).toFixed(1)}% — {selectedPath.nodes.join(' → ')}
+              </span>
+              <button type="button" onClick={() => setSelectedPath(null)} className="shrink-0 px-2 py-0.5 rounded border border-emerald-300 dark:border-emerald-700 text-emerald-700 dark:text-emerald-300 cursor-pointer">Show all</button>
+            </div>
+          )}
 
           {/* Canvas Drawing Surface */}
           <div
@@ -957,8 +974,11 @@ export const DashboardPage: React.FC = () => {
                     const midX = (x1 + x2) / 2;
                     const midY = (y1 + y2) / 2;
 
-                    const strokeColor =
-                      canvasViewMode === 'kill-chain'
+                    const inSelectedPath = selectedPath && selectedPath.edges?.some((pe: any) => pe.source === edge.source && pe.target === edge.target);
+                    const dimmed = selectedPath && !inSelectedPath;
+                    const strokeColor = inSelectedPath
+                      ? '#10b981'
+                      : canvasViewMode === 'kill-chain'
                         ? edge.isBreached ? '#f59e0b' : '#71717a'
                         : edge.isBreached ? '#10b981' : '#3f3f46';
 
@@ -968,7 +988,8 @@ export const DashboardPage: React.FC = () => {
                           d={`M ${x1} ${y1} C ${midX} ${y1}, ${midX} ${y2}, ${x2} ${y2}`}
                           fill="none"
                           stroke={strokeColor}
-                          strokeWidth={edge.isBreached ? '2.5' : '1.5'}
+                          strokeWidth={inSelectedPath ? '4' : edge.isBreached ? '2.5' : '1.5'}
+                          opacity={dimmed ? 0.25 : 1}
                           strokeDasharray={
                             canvasViewMode === 'quantum-walk'
                               ? '6 3'
@@ -1011,6 +1032,8 @@ export const DashboardPage: React.FC = () => {
                 {/* Handcrafted Attack Graph Nodes */}
                 {nodes.map((node) => {
                   const isSelected = node.id === selectedNodeId;
+                  const inSelectedPath = selectedPath && (selectedPath.nodes?.includes(node.id) || selectedPath.nodes?.includes((node as any).ip));
+                  if (inSelectedPath) { nodeBorder = 'border-emerald-500 ring-2 ring-emerald-500/50'; accentColor = 'text-emerald-600 dark:text-emerald-300 font-bold'; }
 
                   let nodeBorder = 'border-zinc-300 dark:border-zinc-700';
                   let accentColor = 'text-zinc-600 dark:text-zinc-400';
@@ -1533,10 +1556,28 @@ export const DashboardPage: React.FC = () => {
             ) : (
               <div className="text-xs text-zinc-400">Load data to see ranked attack paths.</div>
             )}
+            {selectedPath && (
+              <div className="p-3 rounded border border-emerald-500/50 bg-emerald-50 dark:bg-emerald-950/30">
+                <div className="text-[11px] font-semibold text-emerald-700 dark:text-emerald-300">
+                  Selected path #{selectedPath.rank} — {(selectedPath.confidence * 100).toFixed(1)}% confidence
+                </div>
+                <div className="text-xs font-mono text-zinc-800 dark:text-zinc-100 mt-1 break-all">
+                  {selectedPath.nodes.join(' → ')}
+                </div>
+                {selectedPath.edges?.map((e: any, i: number) => (
+                  <div key={i} className="text-[11px] text-zinc-600 dark:text-zinc-300 mt-1">
+                    Hop {i + 1}: {e.source} → {e.target} · {e.protocol} · {e.count} flows, {e.threat_count} threats · {(e.edge_probability * 100).toFixed(1)}%
+                    {e.tactic ? ` · ${e.tactic}` : ''}{e.mitre_id ? ` (${e.mitre_id})` : ''}
+                  </div>
+                ))}
+              </div>
+            )}
             {attackPaths.map((path: any) => (
-              <div key={path.rank} className={`p-3 rounded border ${path.is_most_likely ? 'border-emerald-500/50 bg-emerald-50/50 dark:bg-emerald-950/20' : 'border-zinc-200 dark:border-zinc-800'}`}>
+              <button key={path.rank} type="button"
+                onClick={() => { setSelectedPath(path); setSelectedNodeId(path.nodes[0]); }}
+                className={`w-full text-left p-3 rounded border cursor-pointer transition-colors ${selectedPath?.rank === path.rank ? 'border-emerald-500 bg-emerald-50 dark:bg-emerald-950/30' : 'border-zinc-200 dark:border-zinc-800 hover:border-emerald-400'}`}>
                 <div className="flex items-center justify-between text-xs">
-                  <span className="font-semibold">#{path.rank} {path.is_most_likely ? '— Most likely' : ''}</span>
+                  <span className="font-semibold">#{path.rank} {path.is_most_likely ? '— Most likely' : ''}{selectedPath?.rank === path.rank ? ' — Selected' : ''}</span>
                   <span className="font-mono font-bold text-emerald-600 dark:text-emerald-400">{(path.confidence * 100).toFixed(1)}%</span>
                 </div>
                 <div className="text-[11px] font-mono text-zinc-700 dark:text-zinc-300 mt-1 break-all">
@@ -1546,7 +1587,8 @@ export const DashboardPage: React.FC = () => {
                   {path.total_threats} threats / {path.total_flow} flows · {path.hops} hops
                   {path.tactics?.length ? ` · ${path.tactics.join(', ')}` : ''}
                 </div>
-              </div>
+                <div className="text-[11px] text-emerald-600 dark:text-emerald-400 mt-1">Click to show this path on the graph →</div>
+              </button>
             ))}
             {story && (
               <div className="p-3 rounded border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900/80">
@@ -1558,7 +1600,9 @@ export const DashboardPage: React.FC = () => {
                 </div>
                 {!story.is_sarvam && (
                   <div className="text-[11px] text-amber-600 mt-1">
-                    Set SARVAM_API_KEY in backend/.env and reload for a real Sarvam story; without it this is the fallback text above.
+                    {story.key_configured
+                      ? 'Sarvam key is set, but Sarvam did not answer in time, so this is the fallback text above. Try again, or check the backend log.'
+                      : 'No Sarvam key found by the backend. Put SARVAM_API_KEY in backend/.env, RESTART the backend (a page reload alone does not load .env), then reload this page.'}
                   </div>
                 )}
               </div>
