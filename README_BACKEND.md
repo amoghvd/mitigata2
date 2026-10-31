@@ -193,3 +193,17 @@ Why it is fast on an 8 GB PC:
   the proxy. A DuckDB 2.0 quirk was fixed in this push: `fetchone()`
   left a result open and blocked the next PyArrow batch insert with
   "Resource In Use" -- all counts now use `fetchall()`.
+
+
+## Attack paths, confidence, and the Sarvam story
+- `GET /api/paths` returns every ranked attack path (up to 10, up to 4 hops)
+  with a confidence score each. Confidence = geometric mean of
+  (threat_count + 0.5) / (count + 1) per hop. The top path is flagged
+  `is_most_likely`. Benign-only flows are never listed as attack paths.
+- `GET /api/story` returns a short story of the most likely path, plus
+  `provider` / `is_sarvam`. If `SARVAM_API_KEY` is not set in
+  `backend/.env`, the provider is honestly reported as Ollama fallback
+  or deterministic template -- the UI labels it "NOT Sarvam AI" in that
+  case, instead of pretending it is Sarvam.
+- `POST /api/sample/demo` loads `sample_demo.jsonl` (5 rows, one clear
+  chain) for demos. The dashboard also has a "Tiny Demo (5 rows)" button.
