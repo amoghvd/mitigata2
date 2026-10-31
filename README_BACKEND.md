@@ -65,6 +65,57 @@ from real aggregate numbers. No key is stored in any file in this repo.
    never from a 500-row sample. Graph nodes/edges follow
    `src/types/index.ts` exactly.
 
+## Crazy-fast path for a 6 GB .log file (firex-10G.log and any .log)
+
+Do NOT upload a 6 GB file through the browser. Put it in the repo root
+on your PC and use the parallel local path:
+
+```bash
+# 1. Confirm the format mapping first (no data loaded)
+python -m backend.ingest_file firex-10G.log --detect-only
+#    prints jsonl / apache / syslog / cef / csv / plain + 5 parsed rows
+
+# 2. Full parallel run (4 workers max, Parquet shards -> DuckDB)
+python -m backend.ingest_file firex-10G.log
+#    or via the API: POST /api/ingest/local?path=firex-10G.log
+#    or check first: GET /api/ingest/detect?path=firex-10G.log
+```
+
+How it maps a .log file, automatically:
+- FortiGate UTM (firex-10G.log, exact sample mapping):
+  date+time -> timestamp (eventtime, epoch nanoseconds, is fallback only)
+  srcip -> source_ip, dstip -> destination_ip, dstport -> port,
+  subtype dns -> DNS_QUERY (traffic -> TRAFFIC, webfilter -> WEB_FILTER,
+  ...), service -> event_type if subtype unknown, action pass -> ACCEPT
+  and deny/block/drop/reset -> DENY, sentbyte+rcvdbyte -> bytes,
+  hostname= -> domain (nytimes.com, aljazeera.com), devname= -> device_name.
+  host_name is deliberately left empty: hostname= is the queried DNS
+  domain, not the source host, and devname= is the firewall, not an
+  endpoint. Quoted key=value values with spaces are parsed correctly.
+  Sample logs show the domain in notes, e.g. notes = "nytimes.com".
+- JSONL (ECS/EDR): source.ip, destination.ip, host.name, user.name,
+  event.action, rule.name/id, threat.technique.id -> Mitigata schema.
+- Apache/Nginx access log: IP, user, timestamp, method, status code
+  (>=400 = DENY), byte count -> HTTP_REQUEST.
+- Syslog / plain text: timestamp, IPs, host, ssh/login/auth/dns/
+  kerberos/http/firewall keywords -> event type and DENY on fail/deny.
+- CEF key=value and CSV: src/dst/user/host/action/status positionally
+  or by key.
+- Sigma/MITRE stamping is the same for all formats (see below).
+
+Why it is fast on an 8 GB PC:
+- File is split into byte ranges (aligned to line boundaries, so no
+  row is lost or double-counted), each range is parsed in its own
+  process to a Parquet shard, then DuckDB loads the shards with its
+  C++ Parquet reader. No Python process ever holds the whole file.
+- Workers are capped at 4 (~400-500 MB each) + DuckDB capped at 4 GB,
+  so peak stays under 8 GB. Set MITIGATA_WORKERS=2 if you want less.
+- For files over 500 MB, benign rows drop their raw_message copy
+  (threat rows keep it); the dashboard does not use raw_message.
+  Override with MITIGATA_STORE_RAW=all.
+- Gzip files and files under 100 MB fall back to the single-threaded
+  streaming path, which is still the 12,866 rows/s JSONL path below.
+
 ## Speed on an 8 GB PC (measured, not promised)
 
 - Old code: 200,000 sample rows in 49.2 s = 4,068 rows/s, RSS 289 MB.
@@ -72,11 +123,13 @@ from real aggregate numbers. No key is stored in any file in this repo.
   20,000-row batches + DuckDB memory = half RAM, max 4 GB): the same
   200,000 rows in 15.5 s = 12,866 rows/s, RSS 472 MB, with identical
   counts (200,000 rows, 10,020 alerts; 10,000-row sample = 501 alerts).
-- Extrapolating a 6 GB JSONL log (~8-9M rows at ~700 bytes/line):
-  roughly 11-12 minutes of ingestion, plus the post-load brute-force
-  UPDATE and the dashboard aggregates. The DB file will be roughly
-  3-4 GB, so keep disk free; RAM stays under ~1 GB for the Python
-  process + DuckDB's 4 GB cap, well under 8 GB total.
+- Parallel path, same 200,000-row file: 17,546 rows/s in 11.4 s
+  (main-process RSS 331 MB; workers are additional, capped at 4).
+  Extrapolating a 6.1 GB JSONL log (~8-9M rows at ~700 bytes/line):
+  roughly 8-9 minutes of ingestion with the parallel path, plus the
+  post-load brute-force UPDATE and the dashboard aggregates. The DB
+  file will be roughly 2-4 GB (less with raw dropped for benign rows),
+  so keep disk free; RAM stays under 8 GB total with 4 workers.
 - If your 6 GB file is NOT JSONL (syslog/CSV/CEF), the generic parser
   is used and will be slower than the JSONL fast path; the batch and
   memory settings still apply. Tell Wally the format if it is slow.

@@ -62,6 +62,56 @@ TS_RE = re.compile(
     r"\b(?:\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?"
     r"|\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\b")
 KV_RE = re.compile(r"(\w+)=([^\s]+)")
+# Apache / Nginx combined access log:
+# 127.0.0.1 - frank [10/Oct/2000:13:55:36 -0700] "GET /x HTTP/1.0" 200 2326
+APACHE_RE = re.compile(
+    r'^(\S+) \S+ (\S+) \[([^\]]+)\] "(\S+) ([^"]*?) [^"]*" (\d{3}) (\d+|-)')
+APACHE_TS_FMT = "%d/%b/%Y:%H:%M:%S %z"
+# FortiGate key=value, quoted values may contain spaces, e.g.
+# msg="User logged in from 10.0.0.1"  -- the old (\w+)=([^\s]+) parser
+# split such values at the space and kept the quotes.
+FGT_KV_RE = re.compile(r'(\w+)=("(?:[^"\\]|\\.)*"|\S+)')
+FGT_SUBTYPE_EVENT = {
+    "dns": "DNS_QUERY", "traffic": "TRAFFIC", "webfilter": "WEB_FILTER",
+    "ips": "IPS", "antivirus": "ANTIVIRUS", "app-ctrl": "APP_CTRL",
+    "emailfilter": "EMAIL_FILTER", "dlp": "DLP", "voip": "VOIP",
+}
+FGT_DENY_ACTIONS = {"deny", "block", "blocked", "drop", "dropped", "reset"}
+
+
+def detect_format(lines) -> str:
+    """Auto-detect a .log file's format from its first lines.
+
+    Returns one of: jsonl, apache, csv, cef, syslog, plain.
+    This is what lets one ingestion path handle firex-10G.log (or any
+    other real .log dataset) without the user hand-configuring a parser:
+    the format is read from the data, then mapped to the Mitigata schema
+    (timestamp, source_ip, destination_ip, user, host, event_type,
+    status, port, bytes, sigma/mitre). Send the first ~20 lines of a new
+    file to confirm the mapping before a full 6 GB run."""
+    counts = {"jsonl": 0, "apache": 0, "csv": 0, "cef": 0, "syslog": 0, "plain": 0,
+              "fortigate": 0}
+    for line in lines:
+        s = line.strip() if isinstance(line, str) else ""
+        if not s:
+            continue
+        if s.startswith("{"):
+            counts["jsonl"] += 1
+        elif "srcip=" in s and "dstip=" in s:
+            counts["fortigate"] += 1
+        elif APACHE_RE.match(s):
+            counts["apache"] += 1
+        elif s.startswith("CEF:"):
+            counts["cef"] += 1
+        elif "," in s and IP_RE.search(s):
+            counts["csv"] += 1
+        elif TS_RE.search(s) or IP_RE.search(s):
+            counts["syslog"] += 1
+        else:
+            counts["plain"] += 1
+    if not any(counts.values()):
+        return "plain"
+    return max(counts, key=counts.get)
 
 active_ingestion_jobs: Dict[str, Dict[str, Any]] = {}
 
@@ -308,8 +358,89 @@ def _parse_json_fast(d: dict, raw: str) -> Optional[tuple]:
     sigma, mitre, tactic_out, sev, threat = stamp(
         None, port, event_type, status, explicit_mitre, explicit_tactic,
         rule_name, rule_id, raw=raw)
+    dns_d = d.get("dns") if isinstance(d.get("dns"), dict) else {}
+    q_d = dns_d.get("question") if isinstance(dns_d.get("question"), dict) else {}
+    domain = _nested_str(q_d.get("name") or dst_d.get("domain"))
     return (ts, src, dst, user, host, event_type, status, port, nbytes,
-            sigma, mitre, tactic_out, sev, threat, raw)
+            sigma, mitre, tactic_out, sev, threat, raw, domain, None)
+
+
+def _parse_fortigate(s: str, raw: str) -> Optional[tuple]:
+    """Exact mapping for FortiGate UTM logs (the firex-10G.log sample).
+
+    Input (one line, key=value, quoted values may contain spaces):
+      date=2026-10-23 time=08:48:26 eventtime=1792745306000000000
+      tz="+0530" devname="FGT60FTK00000000" ... subtype="dns" ...
+      srcip=10.10.40.156 srcport=37918 ... dstip=11.113.232.73 dstport=53
+      ... proto=17 action="pass" service="DNS" ... hostname="nytimes.com"
+
+    Output (17-tuple, same order as the schema, domain/device appended):
+      timestamp   = date + time (local time as written; eventtime is only
+                    a fallback, and is epoch nanoseconds, not milliseconds)
+      source_ip   = srcip
+      destination_ip = dstip
+      user_identity = user / srcuser / dstuser, if present (none in the
+                    sample, so None -- never invented from an interface)
+      host_name   = None for FortiGate: hostname= is the *queried DNS
+                    domain*, not the source host, and devname= is the
+                    firewall device, not an endpoint. Both are kept
+                    separately (domain / device_name) instead of being
+                    mislabelled as the host.
+      event_type  = subtype mapped (dns -> DNS_QUERY, traffic -> TRAFFIC,
+                    ...) or service upper-cased if subtype is unknown
+      status      = pass/accept/allow -> ACCEPT; deny/block/drop/reset -> DENY
+      port        = dstport (the service port; srcport is kept in raw)
+      bytes       = sentbyte + rcvdbyte when present (traffic logs),
+                    else network.bytes, else 0 (DNS sample has no byte field)
+      sigma/mitre/tactic/severity/is_threat = stamp() on the full line,
+                    so a DNS-tunnelling / C2 keyword in msg= still fires
+      raw_message = full original line (truncated to 1000 chars)
+      domain      = hostname= (nytimes.com, aljazeera.com in the sample)
+                    or dst domain / dns.question.name for other formats
+      device_name = devname= (FGT60FTK00000000 in the sample)
+    """
+    kv = {}
+    for m in FGT_KV_RE.finditer(s):
+        v = m.group(2)
+        if len(v) >= 2 and v[0] == '"' and v[-1] == '"':
+            v = v[1:-1]
+        kv[m.group(1)] = v
+    if "srcip" not in kv or "dstip" not in kv:
+        return None
+    ts = None
+    if kv.get("date") and kv.get("time"):
+        try:
+            ts = datetime.strptime(f"{kv['date']} {kv['time']}", "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            ts = None
+    if ts is None and kv.get("eventtime"):
+        try:
+            # FortiGate eventtime is epoch *nanoseconds*.
+            ts = datetime.fromtimestamp(int(kv["eventtime"]) / 1_000_000_000,
+                                        tz=timezone.utc).replace(tzinfo=None)
+        except Exception:
+            ts = None
+    subtype = (kv.get("subtype") or "").lower()
+    service = (kv.get("service") or "").upper()
+    event_type = FGT_SUBTYPE_EVENT.get(subtype) or service or subtype.upper() or "TRAFFIC"
+    action = (kv.get("action") or "").lower()
+    status = "DENY" if action in FGT_DENY_ACTIONS else "ACCEPT"
+    try:
+        port = int(kv.get("dstport") or 0)
+    except Exception:
+        port = 0
+    try:
+        nbytes = int(kv.get("sentbyte") or 0) + int(kv.get("rcvdbyte") or 0)
+    except Exception:
+        nbytes = 0
+    user = kv.get("user") or kv.get("srcuser") or kv.get("dstuser") or None
+    domain = kv.get("hostname") or kv.get("domain") or None
+    device = kv.get("devname") or kv.get("devid") or None
+    sigma, mitre, tactic, sev, threat = stamp(
+        None, port, event_type, status, None, None, "", raw=raw)
+    return (ts, kv["srcip"], kv["dstip"], user, None,
+            event_type, status, port, nbytes,
+            sigma, mitre, tactic, sev, threat, raw, domain, device)
 
 
 def parse_line(line: str) -> Optional[tuple]:
@@ -380,6 +511,36 @@ def parse_line(line: str) -> Optional[tuple]:
         except Exception:
             pass  # fall through to heuristic parsing below
 
+    # FortiGate UTM log (firex-10G.log): exact key=value mapping.
+    # Checked before the generic plain-text path, which lost the
+    # timestamp, port, domain and device on these lines.
+    if "srcip=" in s and "dstip=" in s:
+        fgt = _parse_fortigate(s, raw)
+        if fgt is not None:
+            return fgt
+
+    # Apache / Nginx access log: proper mapping, not the generic plain-text
+    # guess (which lost the status code, byte count and user).
+    m_ap = APACHE_RE.match(s)
+    if m_ap:
+        src_ap, user_ap, ts_ap, method_ap, path_ap, status_ap, bytes_ap = m_ap.groups()
+        try:
+            ts = datetime.strptime(ts_ap, APACHE_TS_FMT).replace(tzinfo=None)
+        except Exception:
+            ts = None
+        code = int(status_ap)
+        status = "DENY" if code >= 400 else "ACCEPT"
+        try:
+            nbytes = int(bytes_ap) if bytes_ap != "-" else 0
+        except Exception:
+            nbytes = 0
+        event_type = "HTTP_REQUEST"
+        sigma, mitre, tactic, sev, threat = stamp(
+            None, 80, event_type, status, None, None, "", raw=raw)
+        return (ts, src_ap, None, None if user_ap == "-" else user_ap, None,
+                event_type, status, 80, nbytes,
+                sigma, mitre, tactic, sev, threat, raw)
+
     # CSV: header row is skipped by the caller (see ingest state); a data row
     # with commas and no braces is tried positionally.
     if "," in s and not s.startswith("{"):
@@ -438,10 +599,18 @@ def parse_line(line: str) -> Optional[tuple]:
 class _StreamIngester:
     """Feeds raw bytes (optionally gzip) -> decoded lines -> DB batches."""
 
-    def __init__(self, job_id: Optional[str], filename: str, total_hint: int):
+    def __init__(self, job_id: Optional[str], filename: str, total_hint: int,
+                 raw_threats_only: bool = False):
         self.job_id = job_id
         self.filename = filename
         self.total_hint = total_hint
+        # For a multi-hundred-MB+ file, storing a truncated raw copy of
+        # every benign row roughly doubles the DuckDB file and the insert
+        # work. Threat rows keep their raw text (needed for investigation);
+        # benign rows drop it. The dashboard does not use raw_message
+        # (its notes are rebuilt from sigma/mitre/tactic), so nothing the
+        # UI shows is lost. Override with MITIGATA_STORE_RAW=all.
+        self.raw_threats_only = raw_threats_only
         self.start = time.perf_counter()
         self.bytes_read = 0
         self.rows = 0
@@ -482,6 +651,10 @@ class _StreamIngester:
                 return
         rec = parse_line(line)
         if rec is not None:
+            if len(rec) == 15:
+                rec = rec + (None, None)  # domain, device_name
+            if self.raw_threats_only and not rec[13]:
+                rec = rec[:14] + (None,) + rec[15:]
             self.batch.append(rec)
             if rec[13]:  # is_threat is tuple index 13; 14 is raw_message
                 self.alerts += 1
@@ -548,7 +721,8 @@ async def ingest_upload(file, job_id: Optional[str] = None) -> Tuple[int, int, i
             "total_bytes": total_hint, "percent": 0.0,
             "remaining_bytes": total_hint, "rows_ingested": 0, "elapsed_seconds": 0.0,
         }
-    ing = _StreamIngester(job_id, filename, total_hint)
+    ing = _StreamIngester(job_id, filename, total_hint,
+                          raw_threats_only=_raw_threats_only_for(total_hint))
     try:
         while True:
             chunk = await file.read(CHUNK_SIZE)
@@ -570,12 +744,25 @@ async def ingest_upload(file, job_id: Optional[str] = None) -> Tuple[int, int, i
     return rows, alerts, ing.bytes_read, duration
 
 
+def _raw_threats_only_for(size_bytes: int) -> bool:
+    """True for large files unless the user explicitly asked for all raw
+    text. Env: MITIGATA_STORE_RAW=all (keep everything) or threats_only."""
+    import os as _os
+    mode = _os.environ.get("MITIGATA_STORE_RAW", "").lower()
+    if mode == "all":
+        return False
+    if mode == "threats_only":
+        return True
+    return size_bytes > 500_000_000
+
+
 def ingest_path(path: str, job_id: Optional[str] = None) -> Tuple[int, int, int, float]:
     """Same path for local files (e.g. edr_events.json sample load)."""
     import os
     start = time.perf_counter()
     total_hint = os.path.getsize(path)
-    ing = _StreamIngester(job_id, os.path.basename(path), total_hint)
+    ing = _StreamIngester(job_id, os.path.basename(path), total_hint,
+                          raw_threats_only=_raw_threats_only_for(total_hint))
     with open(path, "rb") as fh:
         while True:
             chunk = fh.read(CHUNK_SIZE)
@@ -586,3 +773,150 @@ def ingest_path(path: str, job_id: Optional[str] = None) -> Tuple[int, int, int,
     duration = time.perf_counter() - start
     _finish_job(ing, duration)
     return rows, alerts, ing.bytes_read, duration
+
+
+# ------------------------------------------------------------ parallel path
+# For a 6 GB file on an 8 GB PC, one Python process is CPU-bound by
+# parsing. Splitting the file into byte ranges and parsing each range in
+# its own process (max 4 workers, each ~400-500 MB) uses all cores, and
+# each worker writes a Parquet shard instead of touching DuckDB. The main
+# process then loads the shards with DuckDB's C++ Parquet reader, which
+# is far faster than per-batch Python inserts. Total peak: workers
+# (~2 GB) + DuckDB (capped 4 GB) + OS, still under 8 GB.
+# Gzip files cannot be byte-split, so they fall back to ingest_path().
+def _rows_to_arrow(rows: List[tuple]):
+    import pyarrow as pa
+    cols = ["timestamp", "source_ip", "destination_ip", "user_identity",
+            "host_name", "event_type", "status", "port", "bytes",
+            "sigma_rule_id", "mitre_id", "tactic", "severity",
+            "is_threat", "raw_message", "domain", "device_name"]
+    types = [pa.timestamp("us")] + [pa.string()] * 6 + [pa.int32(), pa.int64()] \
+        + [pa.string()] * 4 + [pa.bool_(), pa.string(), pa.string(), pa.string()]
+    rows = [r if len(r) == 17 else (r + (None, None)) for r in rows]
+    arrays = []
+    for i, typ in enumerate(types):
+        vals = [r[i] for r in rows]
+        if typ == pa.timestamp("us"):
+            vals = [v if isinstance(v, datetime) else None for v in vals]
+        arrays.append(pa.array(vals, type=typ))
+    return pa.Table.from_arrays(arrays, names=cols)
+
+
+def _worker_segment(args) -> Tuple[int, int, str]:
+    """Top-level (picklable) worker: parse one byte range to one shard."""
+    path, start, end, shard_path, raw_threats_only, is_last = args
+    import pyarrow.parquet as pq
+    rows = 0
+    alerts = 0
+    batch: List[tuple] = []
+    writer = None
+    try:
+        with open(path, "rb") as fh:
+            if start > 0:
+                # Only discard a partial line. If the split point already
+                # falls exactly on a line boundary (previous byte is \n),
+                # the next line is a full line and must NOT be discarded
+                # (the old code lost exactly 1 row per such boundary).
+                fh.seek(start - 1)
+                prev = fh.read(1)
+                if prev != b"\n":
+                    fh.readline()  # discard partial line at the split point
+                # else: fh is already positioned at the start of a line
+            while True:
+                line_start = fh.tell()
+                if not is_last and line_start >= end:
+                    break
+                raw_line = fh.readline()
+                if not raw_line:
+                    break
+                try:
+                    line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                except Exception:
+                    continue
+                if not line.strip():
+                    continue
+                rec = parse_line(line)
+                if rec is None:
+                    continue
+                if len(rec) == 15:
+                    rec = rec + (None, None)  # domain, device_name
+                if raw_threats_only and not rec[13]:
+                    rec = rec[:14] + (None,) + rec[15:]
+                batch.append(rec)
+                if rec[13]:
+                    alerts += 1
+                if len(batch) >= BATCH_SIZE:
+                    tbl = _rows_to_arrow(batch)
+                    if writer is None:
+                        writer = pq.ParquetWriter(shard_path, tbl.schema)
+                    writer.write_table(tbl)
+                    rows += len(batch)
+                    batch.clear()
+        if batch:
+            tbl = _rows_to_arrow(batch)
+            if writer is None:
+                writer = pq.ParquetWriter(shard_path, tbl.schema)
+            writer.write_table(tbl)
+            rows += len(batch)
+            batch.clear()
+    finally:
+        if writer is not None:
+            writer.close()
+    return rows, alerts, shard_path
+
+
+def ingest_path_parallel(path: str, job_id: Optional[str] = None,
+                         workers: Optional[int] = None) -> Tuple[int, int, int, float]:
+    """Parallel ingestion for a local file. Falls back to ingest_path()
+    for small files (<100 MB), gzip files, or when workers <= 1."""
+    import multiprocessing as mp
+    import os
+    import tempfile
+    from backend.database import alerts_count, apply_brute_force_rule, get_db_connection
+    start = time.perf_counter()
+    size = os.path.getsize(path)
+    with open(path, "rb") as fh:
+        is_gzip = fh.read(2) == b"\x1f\x8b"
+    if workers is None:
+        try:
+            workers = int(os.environ.get("MITIGATA_WORKERS", "0")) or None
+        except Exception:
+            workers = None
+    if workers is None:
+        workers = min(4, os.cpu_count() or 4)
+    if size < 100_000_000 or is_gzip or workers <= 1:
+        return ingest_path(path, job_id=job_id)
+    raw_threats_only = _raw_threats_only_for(size)
+    chunk = size // workers
+    ranges = [(i * chunk, (i + 1) * chunk if i < workers - 1 else size)
+              for i in range(workers)]
+    parent = os.path.dirname(os.path.abspath(path))
+    with tempfile.TemporaryDirectory(prefix=".mitigata_shards_", dir=parent) as tmpdir:
+        args = [(path, s, e, os.path.join(tmpdir, f"shard_{i}.parquet"),
+                 raw_threats_only, i == workers - 1)
+                for i, (s, e) in enumerate(ranges)]
+        try:
+            ctx = mp.get_context("fork")
+        except Exception:
+            ctx = mp.get_context("spawn")
+        with ctx.Pool(processes=workers) as pool:
+            results = pool.map(_worker_segment, args)
+        total_rows = 0
+        conn = get_db_connection()
+        from backend.database import _db_lock
+        with _db_lock:
+            for rows, _alerts, shard in results:
+                total_rows += rows
+                if rows and os.path.exists(shard):
+                    conn.execute("INSERT INTO raw_logs SELECT * FROM read_parquet(?)", [shard])
+    apply_brute_force_rule()
+    alerts = alerts_count()
+    duration = time.perf_counter() - start
+    if job_id:
+        active_ingestion_jobs[job_id] = {
+            "status": "completed", "filename": os.path.basename(path),
+            "bytes_processed": size, "total_bytes": size, "percent": 100.0,
+            "remaining_bytes": 0, "rows_ingested": total_rows,
+            "elapsed_seconds": round(duration, 2),
+        }
+    return total_rows, alerts, size, duration

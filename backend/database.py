@@ -28,9 +28,9 @@ _conn: Optional[duckdb.DuckDBPyConnection] = None
 SCHEMA_COLUMNS = (
     "timestamp, source_ip, destination_ip, user_identity, host_name, "
     "event_type, status, port, bytes, sigma_rule_id, mitre_id, tactic, "
-    "severity, is_threat, raw_message"
+    "severity, is_threat, raw_message, domain, device_name"
 )
-INSERT_SQL = f"INSERT INTO raw_logs ({SCHEMA_COLUMNS}) VALUES ({','.join(['?'] * 15)})"
+INSERT_SQL = f"INSERT INTO raw_logs ({SCHEMA_COLUMNS}) VALUES ({','.join(['?'] * 17)})"
 
 
 def _duckdb_memory_limit() -> str:
@@ -109,10 +109,19 @@ def init_schema(conn) -> None:
             tactic VARCHAR,
             severity VARCHAR,
             is_threat BOOLEAN,
-            raw_message VARCHAR
+            raw_message VARCHAR,
+            domain VARCHAR,
+            device_name VARCHAR
         )
         """
     )
+    # Migration for databases created before domain/device_name existed:
+    # DuckDB supports ADD COLUMN IF NOT EXISTS.
+    for col, typ in (("domain", "VARCHAR"), ("device_name", "VARCHAR")):
+        try:
+            conn.execute(f"ALTER TABLE raw_logs ADD COLUMN IF NOT EXISTS {col} {typ}")
+        except Exception:
+            pass
 
 
 def _rows_to_dicts(cursor) -> List[Dict[str, Any]]:
@@ -137,6 +146,7 @@ def bulk_insert_rows(rows: List[tuple]) -> int:
     as the primary path."""
     if not rows:
         return 0
+    rows = [r if len(r) == 17 else (r + (None, None)) for r in rows]
     conn = get_db_connection()
     with _db_lock:
         try:
@@ -144,9 +154,9 @@ def bulk_insert_rows(rows: List[tuple]) -> int:
             cols = ["timestamp", "source_ip", "destination_ip", "user_identity",
                     "host_name", "event_type", "status", "port", "bytes",
                     "sigma_rule_id", "mitre_id", "tactic", "severity",
-                    "is_threat", "raw_message"]
+                    "is_threat", "raw_message", "domain", "device_name"]
             types = [pa.timestamp("us")] + [pa.string()] * 6 + [pa.int32(), pa.int64()] \
-                + [pa.string()] * 4 + [pa.bool_(), pa.string()]
+                + [pa.string()] * 4 + [pa.bool_(), pa.string(), pa.string(), pa.string()]
             arrays = []
             for i, typ in enumerate(types):
                 vals = [r[i] for r in rows]
@@ -217,7 +227,7 @@ def get_sample_logs(limit: int = 50) -> List[Dict[str, Any]]:
             """
             SELECT timestamp, source_ip, destination_ip, event_type, status,
                    port, bytes, sigma_rule_id, mitre_id, tactic, severity,
-                   is_threat, host_name, user_identity
+                   is_threat, host_name, user_identity, domain, device_name
             FROM raw_logs ORDER BY timestamp DESC NULLS LAST LIMIT ?
             """,
             [int(limit)],
@@ -233,6 +243,8 @@ def get_sample_logs(limit: int = 50) -> List[Dict[str, Any]]:
             note = f"{note} {r['mitre_id']}".strip()
         if r.get("tactic"):
             note = f"{note} ({r['tactic']})".strip()
+        if r.get("domain"):
+            note = f"{note} {r['domain']}".strip()
         out.append({
             "id": f"LOG-{i + 1:03d}",
             "timestamp": r.get("timestamp") or "",

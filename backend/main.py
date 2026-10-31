@@ -26,7 +26,9 @@ from backend.database import (
     aggregate_counts, alerts_count, clear_logs, get_health_stats,
     get_sample_logs, init_schema, get_db_connection, ip_host_map, top_edges, total_rows,
 )
-from backend.ingestion import active_ingestion_jobs, ingest_path, ingest_upload
+from backend.ingestion import (active_ingestion_jobs, detect_format,
+                               ingest_path, ingest_path_parallel, ingest_upload,
+                               parse_line)
 from backend.agents.pipeline import build_graph_from_aggregates
 from backend.agents.risk_quantum import compute_risk_from_aggregates, execute_quantum_lookahead
 from backend.agents.reporting import (
@@ -167,6 +169,60 @@ async def ingest(file: UploadFile = File(...), job_id: Optional[str] = Query(Non
         raise HTTPException(status_code=500, detail=f"Ingestion error: {e}")
     finally:
         await file.close()
+    payload = dashboard_payload()
+    payload.update({
+        "ingested_rows": rows, "duration_seconds": round(duration, 3),
+        "throughput_rows_per_second": round(rows / duration, 2) if duration > 0 else float(rows),
+    })
+    return payload
+
+
+@app.get("/api/ingest/detect")
+async def ingest_detect(path: str = Query(...)):
+    """Read the first 200 lines of a file inside the repo root and report
+    its detected format + first parsed rows. No data is loaded."""
+    target = (ROOT / path).resolve()
+    if ROOT not in target.parents and target != ROOT:
+        raise HTTPException(status_code=400, detail="Path must be inside the repo root.")
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail=f"File not found: {path}")
+    with open(target, "rb") as fh:
+        head = [fh.readline().decode("utf-8", errors="replace") for _ in range(200)]
+    fmt = detect_format(head)
+    parsed = []
+    for line in head:
+        if line.strip():
+            rec = parse_line(line.rstrip("\n"))
+            if rec is not None:
+                parsed.append({"timestamp": str(rec[0]), "source_ip": rec[1],
+                               "destination_ip": rec[2], "user": rec[3],
+                               "host": rec[4], "event_type": rec[5],
+                               "status": rec[6], "port": rec[7], "bytes": rec[8],
+                               "sigma": rec[9], "mitre": rec[10], "tactic": rec[11],
+                               "severity": rec[12], "is_threat": rec[13],
+                               "domain": rec[15] if len(rec) > 15 else None,
+                               "device_name": rec[16] if len(rec) > 16 else None})
+            if len(parsed) >= 5:
+                break
+    return {"path": path, "size_bytes": target.stat().st_size,
+            "detected_format": fmt, "sample_rows": parsed}
+
+
+@app.post("/api/ingest/local")
+async def ingest_local(path: str = Query(...), workers: Optional[int] = Query(None)):
+    """Ingest a file already on the server/PC (e.g. firex-10G.log in the
+    repo root) with the parallel path. This avoids uploading 6 GB through
+    the browser. The path must stay inside the repo root."""
+    target = (ROOT / path).resolve()
+    if ROOT not in target.parents and target != ROOT:
+        raise HTTPException(status_code=400, detail="Path must be inside the repo root.")
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail=f"File not found: {path}")
+    try:
+        rows, _alerts, _bytes, duration = ingest_path_parallel(str(target), workers=workers)
+    except Exception as e:
+        logger.error(f"Local ingest failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Ingestion error: {e}")
     payload = dashboard_payload()
     payload.update({
         "ingested_rows": rows, "duration_seconds": round(duration, 3),
