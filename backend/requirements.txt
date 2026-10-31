@@ -1,0 +1,14 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+duckdb>=1.1.0
+pydantic>=2.9.0
+python-multipart>=0.0.12
+networkx>=3.2.1
+pyarrow>=14.0
+numpy>=1.26.0
+reportlab>=4.2.0
+# Optional / heavy: real Qiskit QAOA. If these are not installed, the quantum
+# endpoint returns engine='qiskit-unavailable' with a classical softmax fallback.
+# qiskit>=1.2
+# qiskit-aer>=0.15
+# scipy>=1.11  # only needed by the Qiskit optimizer path

@@ -1,0 +1,13 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+mitigata_logs.duckdb*
+.env
+__pycache__/
+uploads/
+backend/.env
+.venv/
