@@ -1,0 +1,19 @@
+# Mitigata backend (FastAPI + DuckDB). No API key is baked into this file:
+# pass SARVAM_API_KEY via your shell or a local .env file (see backend/.env.example).
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - mitigata_data:/app/data
+    environment:
+      - MITIGATA_DB=/app/data/mitigata_logs.duckdb
+      - SARVAM_API_KEY=${SARVAM_API_KEY:-}
+      - OLLAMA_API_URL=${OLLAMA_API_URL:-http://host.docker.internal:11434/api/generate}
+    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000
+
+volumes:
+  mitigata_data:
