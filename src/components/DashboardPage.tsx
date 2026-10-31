@@ -1033,7 +1033,6 @@ export const DashboardPage: React.FC = () => {
                 {nodes.map((node) => {
                   const isSelected = node.id === selectedNodeId;
                   const inSelectedPath = selectedPath && (selectedPath.nodes?.includes(node.id) || selectedPath.nodes?.includes((node as any).ip));
-                  if (inSelectedPath) { nodeBorder = 'border-emerald-500 ring-2 ring-emerald-500/50'; accentColor = 'text-emerald-600 dark:text-emerald-300 font-bold'; }
 
                   let nodeBorder = 'border-zinc-300 dark:border-zinc-700';
                   let accentColor = 'text-zinc-600 dark:text-zinc-400';
@@ -1064,6 +1063,11 @@ export const DashboardPage: React.FC = () => {
                       accentColor = 'text-zinc-500 dark:text-zinc-400';
                     }
                   }
+                  // Selected-path highlight, applied AFTER the defaults above
+                  // (assigning before the `let` declarations used to throw
+                  // "Cannot access nodeBorder before initialization" and
+                  // blank the whole page to the dark background).
+                  if (inSelectedPath) { nodeBorder = 'border-emerald-500 ring-2 ring-emerald-500/50'; accentColor = 'text-emerald-600 dark:text-emerald-300 font-bold'; }
 
                   return (
                     <div
