@@ -30,6 +30,7 @@ from backend.ingestion import (active_ingestion_jobs, detect_format,
                                ingest_path, ingest_path_parallel, ingest_upload,
                                parse_line)
 from backend.agents.pipeline import build_graph_from_aggregates
+from backend.agents.paths import compute_attack_paths
 from backend.agents.risk_quantum import compute_risk_from_aggregates, execute_quantum_lookahead
 from backend.agents.reporting import (
     GENERATED_REPORTS_CACHE, generate_multilingual_narrative, generate_pdf_report,
@@ -171,16 +172,44 @@ async def dashboard():
 async def ingest(file: UploadFile = File(...), job_id: Optional[str] = Query(None)):
     if not file.filename:
         raise HTTPException(status_code=400, detail="Uploaded file must have a valid filename.")
+    # Why processing was slow before: the old path parsed the upload
+    # stream single-threaded (ingest_upload). For a 6 GB file that is
+    # ~10k rows/s. Instead, stream the upload to disk first (the upload
+    # itself is already fast over localhost), then run the parallel
+    # Parquet-shard ingest on the saved file, then delete the temp copy.
+    # This is the same fast path as ingest_file / /api/ingest/local.
+    uploads_dir = ROOT / "uploads"
+    uploads_dir.mkdir(exist_ok=True)
+    safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in file.filename)
+    tmp_path = uploads_dir / f"{job_id or 'upload'}_{safe_name}"
+    written = 0
     try:
-        rows, alerts, _bytes, duration = await ingest_upload(file, job_id=job_id)
+        with open(tmp_path, "wb") as out:
+            while True:
+                chunk = await file.read(4 * 1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+                written += len(chunk)
+                if job_id:
+                    active_ingestion_jobs[job_id] = {
+                        "status": "processing", "filename": file.filename,
+                        "bytes_processed": written, "total_bytes": written,
+                        "percent": 50.0, "remaining_bytes": 0,
+                        "rows_ingested": 0, "elapsed_seconds": 0.0}
+        rows, alerts, _size, duration = ingest_path_parallel(str(tmp_path), job_id=job_id)
     except Exception as e:
         logger.error(f"Ingest failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Ingestion error: {e}")
     finally:
         await file.close()
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
     # Intentionally NOT dashboard_payload() here: for a 6 GB file that
-    # adds several full-table scans on top of a ~10 minute upload, and
-    # risks a proxy/browser timeout on the upload request itself.
+    # adds several full-table scans on top of a long upload, and risks
+    # a proxy/browser timeout on the upload request itself.
     # The frontend fetches /api/dashboard (and /api/logs/sample) after
     # this returns, so the graph/incidents still display in full.
     return {
@@ -245,6 +274,23 @@ async def ingest_local(path: str = Query(...), workers: Optional[int] = Query(No
     return payload
 
 
+@app.post("/api/sample/demo")
+async def sample_demo():
+    """Tiny 5-row demo sample (sample_demo.jsonl) for a demo, not the
+    10,000-row EDR sample. One clear chain, so the flowchart is easy to
+    explain: external -> workstation -> domain controller -> vault DB,
+    plus one benign DNS row that must NOT become an attack path."""
+    demo = ROOT / "sample_demo.jsonl"
+    if not demo.exists():
+        raise HTTPException(status_code=404, detail="sample_demo.jsonl not found in repo root.")
+    clear_logs()
+    rows, _alerts, _bytes, duration = ingest_path(str(demo))
+    payload = dashboard_payload()
+    payload.update({"ingested_rows": rows, "duration_seconds": round(duration, 3),
+                    "throughput_rows_per_second": round(rows / duration, 2) if duration > 0 else float(rows)})
+    return payload
+
+
 @app.post("/api/sample/load")
 async def sample_load():
     """Clear, then stream edr_events.json through the upload ingestion path.
@@ -298,6 +344,59 @@ async def analyze():
             "topology": {"nodes": graph["nodes"], "edges": graph["edges"],
                          "total_nodes": len(graph["nodes"]), "total_edges": len(graph["edges"])},
             "risk_assessment": risk, "quantum_forecast": quantum}
+
+
+@app.get("/api/paths")
+async def attack_paths():
+    """All ranked attack paths with a confidence score each, and the
+    single most likely path flagged. Built from merged edge aggregates,
+    so it is one DuckDB query, not a full-table scan per path."""
+    result = compute_attack_paths(top_edges(200))
+    result["total_rows"] = total_rows()
+    result["alerts_count"] = alerts_count()
+    return result
+
+
+def _shorten(text: str, max_chars: int = 600) -> str:
+    """Short display version: cut at a sentence boundary near max_chars."""
+    if len(text) <= max_chars:
+        return text
+    cut = text.rfind(". ", 0, max_chars)
+    return (text[:cut + 1] if cut > 200 else text[:max_chars].rsplit(" ", 1)[0] + "…")
+
+
+@app.get("/api/story")
+async def attack_story(language: str = Query("en")):
+    """Short Sarvam AI story of the most likely attack path.
+
+    The provider is reported honestly: if no SARVAM_API_KEY is set (or
+    Sarvam fails), generate_multilingual_narrative falls back to Ollama
+    or a deterministic template, and ai_provider says exactly that --
+    the UI must never label a fallback as 'Sarvam AI'."""
+    paths = compute_attack_paths(top_edges(200))
+    best = paths.get("best_path")
+    agg = aggregate_counts()
+    if not best:
+        return {"provider": "none", "ai_provider": "none",
+                "narrative": "No attack path found: no threat edges in the loaded data.",
+                "narrative_short": "No attack path found: no threat edges in the loaded data.",
+                "best_path": None, "paths": []}
+    chain = " -> ".join(best["nodes"])
+    ctx = {"title": f"Most likely attack path: {chain}",
+           "severity": "CRITICAL", "score": round(best["confidence"] * 10, 1),
+           "target_asset": best["nodes"][-1],
+           "predicted_next_hop": best["nodes"][-1],
+           "probability": best["confidence"],
+           "total_rows": agg["total_rows"], "alerts_count": agg["alerts_count"],
+           "mitre_tactics": best["tactics"] or ["Unknown"]}
+    lang = language if language in ("en", "hi", "te", "ml") else "en"
+    res = generate_multilingual_narrative(ctx, language=lang)
+    return {"provider": res["provider"], "ai_provider": res["provider"],
+            "is_sarvam": res["provider"] == "Sarvam AI",
+            "narrative": res["narrative"],
+            "narrative_short": _shorten(res["narrative"]),
+            "best_path": best, "paths": paths["paths"],
+            "confidence_formula": paths["confidence_formula"]}
 
 
 @app.get("/api/graph/topology")

@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   Incident,
   IncidentSeverity,
@@ -108,12 +108,47 @@ export const DashboardPage: React.FC = () => {
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [zoomLevel, setZoomLevel] = useState<number>(100);
   const [canvasViewMode, setCanvasViewMode] = useState<'kill-chain' | 'quantum-walk'>('kill-chain');
+  const [attackPaths, setAttackPaths] = useState<any[]>([]);
+  const [bestPath, setBestPath] = useState<any | null>(null);
+  const [story, setStory] = useState<{ narrative_short: string; provider: string; is_sarvam: boolean } | null>(null);
 
   // Smooth Pan & Drag State for Canvas
   const [panOffset, setPanOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const [isDraggingCanvas, setIsDraggingCanvas] = useState(false);
   const dragStartRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   const panStartRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+
+  const fetchPathsAndStory = async () => {
+    try {
+      const pr = await fetch('/api/paths');
+      if (pr.ok) { const pd = await pr.json(); setAttackPaths(pd.paths || []); setBestPath(pd.best_path || null); }
+    } catch {}
+    try {
+      const sr = await fetch('/api/story');
+      if (sr.ok) { const sd = await sr.json(); if (sd.best_path) setStory(sd); }
+    } catch {}
+  };
+
+  // Restore data already in DuckDB on page load. Before this, a refresh
+  // emptied the whole dashboard even though the DB still had the data --
+  // that is why uploaded data "suddenly disappeared".
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch('/api/dashboard');
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data.total_rows > 0) {
+          if (data.sample_logs?.length) setDuckdbLogs(data.sample_logs);
+          if (data.incidents?.length) { setIncidents(data.incidents); setSelectedIncidentId(data.incidents[0].id); }
+          if (data.nodes?.length) { setNodes(data.nodes); setSelectedNodeId(data.nodes[0].id); }
+          if (data.edges?.length) setEdges(data.edges);
+          await fetchPathsAndStory();
+        }
+      } catch {}
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const activeIncident = incidents.find((i) => i.id === selectedIncidentId) || null;
   const activeNode = nodes.find((n) => n.id === selectedNodeId) || null;
@@ -295,8 +330,9 @@ export const DashboardPage: React.FC = () => {
         if (data.edges && data.edges.length > 0) {
           setEdges(data.edges);
         }
-        setSelectedNodeId('node-dc');
+        setSelectedNodeId(data.nodes?.[0]?.id || 'node-dc');
         setIsProcessingLogs(false);
+        await fetchPathsAndStory();
 
         const msg = `Sample telemetry loaded: ${(data.total_rows || 10000).toLocaleString()} rows indexed, ${(data.alerts_count || 530).toLocaleString()} threats flagged by Sarvam AI.`;
         setUploadCompletionMessage(msg);
@@ -351,6 +387,23 @@ export const DashboardPage: React.FC = () => {
         setUploadCompletionMessage(null);
       }, 3000);
     }, 550);
+  };
+
+  const handleLoadDemoSample = async () => {
+    setIsProcessingLogs(true);
+    try {
+      const resp = await fetch('/api/sample/demo', { method: 'POST' });
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data.sample_logs?.length) setDuckdbLogs(data.sample_logs);
+        if (data.incidents?.length) { setIncidents(data.incidents); setSelectedIncidentId(data.incidents[0].id); }
+        if (data.nodes?.length) { setNodes(data.nodes); setSelectedNodeId(data.nodes[0].id); }
+        if (data.edges?.length) setEdges(data.edges);
+        await fetchPathsAndStory();
+        showNotification(`Tiny demo loaded: ${data.total_rows} rows, ${data.alerts_count} alerts.`);
+      }
+    } catch { showNotification('Demo sample failed to load.'); }
+    setIsProcessingLogs(false);
   };
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -473,7 +526,7 @@ export const DashboardPage: React.FC = () => {
             const dashRes = await fetch('/api/dashboard');
             if (dashRes.ok) {
               const dash = await dashRes.json();
-              if (dash.nodes && dash.nodes.length > 0) { setNodes(dash.nodes); hasRealGraph = true; }
+              if (dash.nodes && dash.nodes.length > 0) { setNodes(dash.nodes); setSelectedNodeId(dash.nodes[0].id); hasRealGraph = true; }
               if (dash.edges && dash.edges.length > 0) { setEdges(dash.edges); hasRealGraph = true; }
               if (dash.incidents && dash.incidents.length > 0) {
                 setIncidents(dash.incidents);
@@ -492,7 +545,7 @@ export const DashboardPage: React.FC = () => {
               setSelectedIncidentId(result.incidents[0].id);
             }
           }
-          setSelectedNodeId('node-dc');
+          await fetchPathsAndStory();
 
           setIsProcessingLogs(false);
           const successMsg = `Successfully ingested ${(result.ingested_rows || 0).toLocaleString()} rows from ${fileName} in ${result.duration_seconds}s (${(result.throughput_rows_per_second || 0).toLocaleString()} rows/s). ${(result.alerts_count || 0).toLocaleString()} alerts analyzed by Sarvam AI.`;
@@ -524,9 +577,12 @@ export const DashboardPage: React.FC = () => {
   };
 
   const handleQuarantineNode = (nodeId: string) => {
+    // Real graph node ids are IPs; mock node ids are 'node-dc' etc.
+    // Match either, otherwise the button changed the incident status
+    // but no node on the canvas ever turned quarantined.
     setNodes((prev) =>
       prev.map((n) =>
-        n.id === nodeId ? { ...n, status: 'quarantined' as const } : n
+        (n.id === nodeId || (n as any).ip === nodeId) ? { ...n, status: 'quarantined' as const } : n
       )
     );
     if (activeIncident) {
@@ -1241,6 +1297,15 @@ export const DashboardPage: React.FC = () => {
                   <span>Load Sample</span>
                 </button>
               )}
+              <button
+                type="button"
+                onClick={handleLoadDemoSample}
+                disabled={isProcessingLogs}
+                title="Load the tiny 5-row demo (sample_demo.jsonl) for a simple flowchart explanation"
+                className="py-1.5 px-2.5 text-[11px] font-mono text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-900 disabled:opacity-50 disabled:cursor-not-allowed rounded border border-zinc-200 dark:border-zinc-800 flex items-center gap-1 transition-colors cursor-pointer"
+              >
+                <span>Tiny Demo (5 rows)</span>
+              </button>
             </div>
 
             {/* Filter log rows input */}
@@ -1442,10 +1507,68 @@ export const DashboardPage: React.FC = () => {
               </div>
             )}
 
+          {/* Attack Paths + Sarvam Story: ranked paths, confidence each, best path first */}
+          <div className="p-4 flex flex-col gap-3 border-t border-zinc-200 dark:border-zinc-800">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-mono uppercase tracking-wider text-zinc-800 dark:text-zinc-200 font-semibold">
+                Attack Paths — Ranked
+              </span>
+              <span className="text-[10px] font-mono text-zinc-500">
+                {attackPaths.length ? `${attackPaths.length} paths` : 'No paths yet'}
+              </span>
+            </div>
+            {bestPath ? (
+              <div className="p-3 rounded border border-emerald-500/50 bg-emerald-50 dark:bg-emerald-950/30">
+                <div className="text-[11px] font-semibold text-emerald-700 dark:text-emerald-300">
+                  ★ Most likely path — {(bestPath.confidence * 100).toFixed(1)}% confidence
+                </div>
+                <div className="text-xs font-mono text-zinc-800 dark:text-zinc-100 mt-1 break-all">
+                  {bestPath.nodes.join(' → ')}
+                </div>
+                <div className="text-[11px] text-zinc-500 mt-1">
+                  {bestPath.total_threats} threat events over {bestPath.total_flow} flows, {bestPath.hops} hops.
+                  Confidence = geometric mean of (threats + 0.5) / (flows + 1) per hop.
+                </div>
+              </div>
+            ) : (
+              <div className="text-xs text-zinc-400">Load data to see ranked attack paths.</div>
+            )}
+            {attackPaths.map((path: any) => (
+              <div key={path.rank} className={`p-3 rounded border ${path.is_most_likely ? 'border-emerald-500/50 bg-emerald-50/50 dark:bg-emerald-950/20' : 'border-zinc-200 dark:border-zinc-800'}`}>
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-semibold">#{path.rank} {path.is_most_likely ? '— Most likely' : ''}</span>
+                  <span className="font-mono font-bold text-emerald-600 dark:text-emerald-400">{(path.confidence * 100).toFixed(1)}%</span>
+                </div>
+                <div className="text-[11px] font-mono text-zinc-700 dark:text-zinc-300 mt-1 break-all">
+                  {path.nodes.join(' → ')}
+                </div>
+                <div className="text-[11px] text-zinc-500 mt-1">
+                  {path.total_threats} threats / {path.total_flow} flows · {path.hops} hops
+                  {path.tactics?.length ? ` · ${path.tactics.join(', ')}` : ''}
+                </div>
+              </div>
+            ))}
+            {story && (
+              <div className="p-3 rounded border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900/80">
+                <div className="text-[11px] font-semibold text-zinc-800 dark:text-zinc-100">
+                  Attack story — {story.is_sarvam ? 'by Sarvam AI' : `NOT Sarvam AI: ${story.provider}`}
+                </div>
+                <div className="text-xs text-zinc-600 dark:text-zinc-300 mt-1 whitespace-pre-wrap">
+                  {story.narrative_short}
+                </div>
+                {!story.is_sarvam && (
+                  <div className="text-[11px] text-amber-600 mt-1">
+                    Set SARVAM_API_KEY in backend/.env and reload for a real Sarvam story; without it this is the fallback text above.
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
             {/* Execute Quarantine Action Button */}
             <button
               type="button"
-              onClick={() => handleQuarantineNode('node-dc')}
+              onClick={() => handleQuarantineNode(activeIncident ? activeIncident.ipAddress : 'node-dc')}
               disabled={!activeIncident || activeIncident.status === 'contained'}
               className={`w-full py-2.5 px-3 rounded-md text-xs font-semibold flex items-center justify-center gap-2 transition-colors cursor-pointer ${
                 !activeIncident || activeIncident.status === 'contained'
