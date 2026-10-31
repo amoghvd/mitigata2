@@ -9,10 +9,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
-    "lint": "tsc --noEmit",
-    "backend": "uvicorn backend.main:app --host 0.0.0.0 --port 8000",
-    "frontend": "vite --port 5173",
-    "dev:full": "echo 'Run in two terminals: npm run backend  AND  npm run frontend (vite proxies /api to :8000)'"
+    "lint": "tsc --noEmit"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
