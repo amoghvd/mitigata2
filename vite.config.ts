@@ -13,7 +13,14 @@ export default defineConfig(() => {
     },
     server: {
       proxy: {
-        '/api': 'http://localhost:8000',
+        // Long timeout: a 6 GB upload + ingest takes many minutes.
+        // The default Vite proxy timeout would drop it mid-upload.
+        '/api': {
+          target: 'http://localhost:8000',
+          changeOrigin: true,
+          timeout: 3600000,
+          proxyTimeout: 3600000,
+        },
       },
       // HMR is disabled in AI Studio via DISABLE_HMR env var.
       // Do not modify—file watching is disabled to prevent flickering during agent edits.

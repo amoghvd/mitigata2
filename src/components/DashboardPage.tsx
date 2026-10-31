@@ -464,23 +464,35 @@ export const DashboardPage: React.FC = () => {
             } catch {}
           }
 
-          if (result.nodes && result.nodes.length > 0) {
-            setNodes(result.nodes);
-          } else {
-            setNodes(MOCK_GRAPH_NODES);
-          }
-
-          if (result.edges && result.edges.length > 0) {
-            setEdges(result.edges);
-          } else {
-            setEdges(MOCK_GRAPH_EDGES);
+          // For a large upload /api/ingest no longer returns the full
+          // dashboard (to avoid timing out the upload request). Fetch it
+          // separately; only fall back to mocks if neither the dashboard
+          // nor the ingest response gave us a real graph.
+          let hasRealGraph = false;
+          try {
+            const dashRes = await fetch('/api/dashboard');
+            if (dashRes.ok) {
+              const dash = await dashRes.json();
+              if (dash.nodes && dash.nodes.length > 0) { setNodes(dash.nodes); hasRealGraph = true; }
+              if (dash.edges && dash.edges.length > 0) { setEdges(dash.edges); hasRealGraph = true; }
+              if (dash.incidents && dash.incidents.length > 0) {
+                setIncidents(dash.incidents);
+                setSelectedIncidentId(dash.incidents[0].id);
+              }
+              if (dash.sample_logs && dash.sample_logs.length > 0) setDuckdbLogs(dash.sample_logs);
+            }
+          } catch {}
+          if (!hasRealGraph) {
+            if (result.nodes && result.nodes.length > 0) setNodes(result.nodes);
+            else setNodes(MOCK_GRAPH_NODES);
+            if (result.edges && result.edges.length > 0) setEdges(result.edges);
+            else setEdges(MOCK_GRAPH_EDGES);
+            if (result.incidents && result.incidents.length > 0) {
+              setIncidents(result.incidents);
+              setSelectedIncidentId(result.incidents[0].id);
+            }
           }
           setSelectedNodeId('node-dc');
-
-          if (result.incidents && result.incidents.length > 0) {
-            setIncidents(result.incidents);
-            setSelectedIncidentId(result.incidents[0].id);
-          }
 
           setIsProcessingLogs(false);
           const successMsg = `Successfully ingested ${(result.ingested_rows || 0).toLocaleString()} rows from ${fileName} in ${result.duration_seconds}s (${(result.throughput_rows_per_second || 0).toLocaleString()} rows/s). ${(result.alerts_count || 0).toLocaleString()} alerts analyzed by Sarvam AI.`;

@@ -84,9 +84,9 @@ def get_db_connection() -> duckdb.DuckDBPyConnection:
                 # system RAM, capped at 4 GB, so DuckDB + the Python batch
                 # (~20 MB) + the OS still fit comfortably under 8 GB.
                 # The old fixed 2 GB / 4 threads under-used a modern PC.
-                _conn.execute(f"PRAGMA threads={max(1, os.cpu_count() or 4)}")
-                _conn.execute(f"PRAGMA memory_limit='{_duckdb_memory_limit()}'")
-                _conn.execute("PRAGMA preserve_insertion_order=false")
+                _conn.execute(f"PRAGMA threads={max(1, os.cpu_count() or 4)}").fetchall()
+                _conn.execute(f"PRAGMA memory_limit='{_duckdb_memory_limit()}'").fetchall()
+                _conn.execute("PRAGMA preserve_insertion_order=false").fetchall()
                 init_schema(_conn)
     return _conn
 
@@ -114,12 +114,12 @@ def init_schema(conn) -> None:
             device_name VARCHAR
         )
         """
-    )
+    ).fetchall()
     # Migration for databases created before domain/device_name existed:
     # DuckDB supports ADD COLUMN IF NOT EXISTS.
     for col, typ in (("domain", "VARCHAR"), ("device_name", "VARCHAR")):
         try:
-            conn.execute(f"ALTER TABLE raw_logs ADD COLUMN IF NOT EXISTS {col} {typ}")
+            conn.execute(f"ALTER TABLE raw_logs ADD COLUMN IF NOT EXISTS {col} {typ}").fetchall()
         except Exception:
             pass
 
@@ -166,7 +166,7 @@ def bulk_insert_rows(rows: List[tuple]) -> int:
             tbl = pa.Table.from_arrays(arrays, names=cols)
             conn.register("_mitigata_batch", tbl)
             try:
-                conn.execute("INSERT INTO raw_logs SELECT * FROM _mitigata_batch")
+                conn.execute("INSERT INTO raw_logs SELECT * FROM _mitigata_batch").fetchall()
             finally:
                 conn.unregister("_mitigata_batch")
         except ImportError:
@@ -177,13 +177,13 @@ def bulk_insert_rows(rows: List[tuple]) -> int:
 def clear_logs() -> None:
     conn = get_db_connection()
     with _db_lock:
-        conn.execute("DELETE FROM raw_logs")
+        conn.execute("DELETE FROM raw_logs").fetchall()
 
 
 def _count(sql: str, params=()) -> int:
     conn = get_db_connection()
     with _db_lock:
-        return int(conn.execute(sql, params).fetchone()[0])
+        return int(conn.execute(sql, params).fetchall()[0][0])
 
 
 def total_rows() -> int:
@@ -263,8 +263,8 @@ def get_sample_logs(limit: int = 50) -> List[Dict[str, Any]]:
 def aggregate_counts() -> Dict[str, Any]:
     conn = get_db_connection()
     with _db_lock:
-        total = int(conn.execute("SELECT COUNT(*) FROM raw_logs").fetchone()[0])
-        alerts = int(conn.execute("SELECT COUNT(*) FROM raw_logs WHERE is_threat").fetchone()[0])
+        total = int(conn.execute("SELECT COUNT(*) FROM raw_logs").fetchall()[0][0])
+        alerts = int(conn.execute("SELECT COUNT(*) FROM raw_logs WHERE is_threat").fetchall()[0][0])
         tactics = _rows_to_dicts(conn.execute(
             "SELECT tactic, COUNT(*) AS cnt FROM raw_logs WHERE is_threat GROUP BY tactic ORDER BY cnt DESC"))
         severities = _rows_to_dicts(conn.execute(
@@ -274,7 +274,7 @@ def aggregate_counts() -> Dict[str, Any]:
         hosts = _rows_to_dicts(conn.execute(
             "SELECT host_name, COUNT(*) AS cnt FROM raw_logs WHERE is_threat GROUP BY host_name ORDER BY cnt DESC LIMIT 10"))
         distinct = conn.execute(
-            "SELECT COUNT(DISTINCT source_ip), COUNT(DISTINCT destination_ip), COUNT(DISTINCT tactic) FROM raw_logs WHERE is_threat").fetchone()
+            "SELECT COUNT(DISTINCT source_ip), COUNT(DISTINCT destination_ip), COUNT(DISTINCT tactic) FROM raw_logs WHERE is_threat").fetchall()[0]
         by_target = _rows_to_dicts(conn.execute(
             """
             SELECT destination_ip, host_name, tactic, mitre_id, severity, COUNT(*) AS cnt
@@ -364,6 +364,7 @@ def apply_brute_force_rule(min_failures: int = 10) -> int:
             """,
             [min_failures],
         )
+        cur.fetchall()
         return int(cur.rowcount or 0)
 
 

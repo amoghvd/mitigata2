@@ -158,23 +158,37 @@ async def ingest_progress(job_id: str = Query(...)):
 
 
 # ------------------------------------------------------------ ingest / sample
+@app.get("/api/dashboard")
+async def dashboard():
+    """Full dashboard payload (aggregates, graph, risk, quantum, incidents).
+    Kept separate from /api/ingest so a 6 GB upload request does not also
+    have to wait for the full dashboard computation before it returns:
+    the frontend fetches this after the upload finishes."""
+    return dashboard_payload()
+
+
 @app.post("/api/ingest")
 async def ingest(file: UploadFile = File(...), job_id: Optional[str] = Query(None)):
     if not file.filename:
         raise HTTPException(status_code=400, detail="Uploaded file must have a valid filename.")
     try:
-        rows, _alerts, _bytes, duration = await ingest_upload(file, job_id=job_id)
+        rows, alerts, _bytes, duration = await ingest_upload(file, job_id=job_id)
     except Exception as e:
         logger.error(f"Ingest failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Ingestion error: {e}")
     finally:
         await file.close()
-    payload = dashboard_payload()
-    payload.update({
-        "ingested_rows": rows, "duration_seconds": round(duration, 3),
+    # Intentionally NOT dashboard_payload() here: for a 6 GB file that
+    # adds several full-table scans on top of a ~10 minute upload, and
+    # risks a proxy/browser timeout on the upload request itself.
+    # The frontend fetches /api/dashboard (and /api/logs/sample) after
+    # this returns, so the graph/incidents still display in full.
+    return {
+        "ingested_rows": rows, "alerts_count": alerts, "total_rows": total_rows(),
+        "sample_logs": get_sample_logs(50),
+        "duration_seconds": round(duration, 3),
         "throughput_rows_per_second": round(rows / duration, 2) if duration > 0 else float(rows),
-    })
-    return payload
+    }
 
 
 @app.get("/api/ingest/detect")
@@ -233,10 +247,25 @@ async def ingest_local(path: str = Query(...), workers: Optional[int] = Query(No
 
 @app.post("/api/sample/load")
 async def sample_load():
-    """Clear, then stream edr_events.json through the upload ingestion path."""
+    """Clear, then stream edr_events.json through the upload ingestion path.
+
+    The sample file cannot be committed via the GitHub snapshot route
+    (it is 7.2 MB and the route returns 413), so a fresh clone will not
+    have it. In that case generate an equivalent 10,000-event sample
+    with the generator already in the repo, instead of 404ing."""
     sample = ROOT / "edr_events.json"
     if not sample.exists():
-        raise HTTPException(status_code=404, detail="edr_events.json not found in repo root.")
+        import subprocess
+        import sys
+        gen = ROOT / "edr_log_generator.py"
+        if not gen.exists():
+            raise HTTPException(status_code=404, detail="edr_events.json not found in repo root.")
+        proc = subprocess.run(
+            [sys.executable, str(gen), "--count", "10000", "--output", "file",
+             "--file", str(sample)],
+            capture_output=True, text=True, timeout=300)
+        if not sample.exists():
+            raise HTTPException(status_code=500, detail=f"Could not generate sample: {proc.stderr[:500]}")
     clear_logs()
     start = time.perf_counter()
     rows, _alerts, _bytes, duration = ingest_path(str(sample))

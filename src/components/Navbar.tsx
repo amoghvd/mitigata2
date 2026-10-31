@@ -24,7 +24,7 @@ export const Navbar: React.FC<NavbarProps> = ({
           className="flex items-center gap-2.5 text-left group focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 rounded-md shrink-0 cursor-pointer"
         >
           <img
-            src="/logo.png"
+            src="/logo.svg"
             alt="ASK Logo"
             className="w-8 h-8 object-contain"
           />

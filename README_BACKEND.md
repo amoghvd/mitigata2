@@ -171,3 +171,25 @@ Why it is fast on an 8 GB PC:
   are reported; candidate next-hop probabilities are a classical softmax
   over graph weights, labelled as such in the engine string. If Qiskit is
   not installed, `quantum_engine` is exactly `qiskit-unavailable`.
+
+
+## Complete push: what is in the repo, and what cannot be pushed this way
+- All code, backend, frontend, Dockerfile, docker-compose, requirements,
+  RUNNING_LOCALLY.md and this README are on GitHub (amoghvd/mitigata2).
+- `edr_events.json` (7.2 MB) and the PNG images cannot be pushed through
+  the GitHub snapshot route: it only accepts UTF-8 text and returns 413
+  for the 7.2 MB sample, and rejects PNGs as "not UTF-8". They are NOT
+  needed to run: the logo is now `public/logo.svg` (text, in the repo),
+  and `POST /api/sample/load` auto-generates a 10,000-event sample with
+  `edr_log_generator.py` if `edr_events.json` is missing. If you want
+  the exact original sample, run that generator yourself, or upload
+  `edr_events.json` via the GitHub web UI.
+- Uploading a 6 GB file: do NOT use the browser upload as the only path.
+  Put the file in the repo root and use `python -m backend.ingest_file
+  firex-10G.log` (parallel) or `POST /api/ingest/local?path=firex-10G.log`.
+  The browser upload (`POST /api/ingest`) now returns after parsing and
+  the frontend fetches `GET /api/dashboard` separately, and the Vite
+  proxy timeout is set to 1 hour, so a long upload is not dropped by
+  the proxy. A DuckDB 2.0 quirk was fixed in this push: `fetchone()`
+  left a result open and blocked the next PyArrow batch insert with
+  "Resource In Use" -- all counts now use `fetchall()`.
